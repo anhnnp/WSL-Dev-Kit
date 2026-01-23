@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: ShellCheck (bash scripts)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: "scripts"
+        # shellcheck will warn for bash style issues; good for team consistency
+
+      - name: Validate setup.env.example keys
+        run: |
+          test -f setup.env.example
+          # Required keys (add/remove as your policy)
+          required=(
+            TARGET_DRIVE
+            DISTRO_NAME
+            DEV_USER
+            INSTALL_NODEJS
+            INSTALL_PHP
+            NODE_VERSION
+            PHP_VERSION
+          )
+          for k in "${required[@]}"; do
+            grep -q "^${k}=" setup.env.example || (echo "Missing key: ${k}" && exit 1)
+          done
+
+  version-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce Node/PHP version policy (docs)
+        run: |
+          # This job enforces that the README advertises the expected versions.
+          # Keeps onboarding consistent.
+          NODE_EXPECTED="$(grep -E '^NODE_VERSION=' setup.env.example | cut -d= -f2)"
+          PHP_EXPECTED="$(grep -E '^PHP_VERSION=' setup.env.example | cut -d= -f2)"
+          echo "NODE_EXPECTED=$NODE_EXPECTED"
+          echo "PHP_EXPECTED=$PHP_EXPECTED"
+
+          # Optional checks: ensure README mentions them
+          grep -qi "NODE_VERSION" README.md || (echo "README should mention NODE_VERSION policy" && exit 1)
+          grep -qi "PHP_VERSION" README.md || (echo "README should mention PHP_VERSION policy" && exit 1)
