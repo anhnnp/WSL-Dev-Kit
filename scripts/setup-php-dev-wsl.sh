@@ -88,11 +88,42 @@ apt-get update -y
 
 # Core tools
 log_info "Installing core tools..."
+export DEBIAN_FRONTEND=noninteractive
+export COMPOSER_NO_INTERACTION=1
 apt_install git unzip zip supervisor composer
 
 # Web servers + DB
 log_info "Installing Nginx + Apache2 + MariaDB..."
 apt_install nginx nginx-extras apache2 mariadb-server mariadb-client
+
+log_info "Enable & start MariaDB..."
+systemctl enable --now mariadb >/dev/null 2>&1 || true
+systemctl restart mariadb >/dev/null 2>&1 || true
+
+log_info "Configuring MariaDB for DEV (utf8mb4, localhost-only, slow log)..."
+
+tee /etc/mysql/mariadb.conf.d/99-dev.cnf >/dev/null <<'EOF'
+[mysqld]
+# Charset best practice
+character-set-server = utf8mb4
+collation-server     = utf8mb4_unicode_ci
+
+# Security (DEV in WSL)
+bind-address         = 127.0.0.1
+
+# DEV debugging
+slow_query_log       = 1
+long_query_time      = 0.5
+slow_query_log_file  = /var/log/mysql/mariadb-slow.log
+EOF
+
+systemctl restart mariadb || true
+
+log_info "Creating DEV database & user..."
+
+mariadb -e "CREATE USER IF NOT EXISTS 'dev'@'localhost' IDENTIFIED BY 'dev';"
+mariadb -e "GRANT ALL PRIVILEGES ON *.* TO 'dev'@'localhost';"
+mariadb -e "FLUSH PRIVILEGES;"
 
 # Enable Apache modules for proxy_fcgi
 log_info "Enabling Apache modules (proxy/proxy_fcgi/setenvif/rewrite/headers)..."
@@ -540,7 +571,7 @@ echo "============================================================"
 echo
 echo "---- Versions ----"
 echo -n "PHP (CLI): "; php -v | head -n 1 || true
-echo -n "Composer: "; composer --version 2>/dev/null || true
+echo -n "Composer: "; composer --version --no-interaction 2>/dev/null || true
 echo -n "Nginx: "; nginx -v 2>&1 || true
 echo -n "Apache: "; apache2 -v | head -n 1 2>/dev/null || true
 echo -n "WP-CLI: "; wp --version 2>/dev/null || true
