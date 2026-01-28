@@ -338,6 +338,18 @@ find "${VHM_ROOT}" -type f -exec chmod 0644 {} \; || true
 
 log_ok "vhost-manager deployed at: ${VHM_ROOT}"
 
+log_info "Disabling WSL auto-generated hosts..."
+cat > /etc/wsl.conf <<'EOF'
+[boot]
+systemd=true
+
+[user]
+default=anhnnp
+
+[network]
+generateHosts = false
+EOF
+
 # Ensure /etc/hosts has domain (WSL side)
 ensure_hosts_entry "${VHM_DOMAIN}"
 
