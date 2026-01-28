@@ -485,6 +485,33 @@ else
 fi
 
 # -----------------------------
+# Default service preference: NGINX ON, APACHE OFF
+# -----------------------------
+log_info "Setting default web server: NGINX enabled (startup), APACHE disabled (inactive by default)..."
+
+# Ensure nginx is enabled and running
+systemctl enable nginx >/dev/null 2>&1 || true
+systemctl restart nginx >/dev/null 2>&1 || true
+
+# Disable apache2 by default to avoid port 80 conflicts
+systemctl stop apache2 >/dev/null 2>&1 || true
+systemctl disable apache2 >/dev/null 2>&1 || true
+
+# Optional: also disable apache2's socket units if present (best-effort)
+systemctl disable apache2.service >/dev/null 2>&1 || true
+
+# Verify
+ng_state="$(systemctl is-active nginx 2>/dev/null || echo unknown)"
+ap_state="$(systemctl is-active apache2 2>/dev/null || echo unknown)"
+log_ok "nginx status: ${ng_state}"
+log_ok "apache2 status: ${ap_state} (expected: inactive)"
+
+echo
+log_info "If you ever want Apache instead:"
+echo "  sudo systemctl stop nginx && sudo systemctl disable nginx"
+echo "  sudo systemctl enable --now apache2"
+
+# -----------------------------
 # Notes: Nginx & Apache both binding :80
 # -----------------------------
 echo
