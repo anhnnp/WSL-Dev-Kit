@@ -1,196 +1,527 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ------------------------------------------------------------
-# Multi-PHP Dev Setup for WSL Ubuntu 22.04 (Windows host)
-# Stack: Nginx + PHP-FPM (8.1/8.2/8.3) + Laravel + WordPress
-# DB: MariaDB/MySQL
-# Repo: Ondrej PHP PPA
-# ------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Repo root: scripts/..  (repo has vhost-manager/ at root)
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ---- Helpers ----
-GREEN="\033[0;32m"
-YELLOW="\033[0;33m"
-RED="\033[0;31m"
-NC="\033[0m"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
 
-log()  { echo -e "${GREEN}==> ${NC}$*"; }
-warn() { echo -e "${YELLOW}==> ${NC}$*"; }
-err()  { echo -e "${RED}==> ${NC}$*" 1>&2; }
+banner "WSL Dev Kit - PHP Dev Setup + vhost-manager.local (Nginx + Apache + PHP-FPM 8.2)"
 
-need_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    err "Vui lòng chạy script bằng sudo: sudo bash setup-php-dev-wsl.sh"
-    exit 1
+require_wsl
+require_root
+
+export DEBIAN_FRONTEND=noninteractive
+
+# -----------------------------
+# Config (can be overridden via env)
+# -----------------------------
+PHP_VERSIONS_DEFAULT=("8.1" "8.2" "8.3")
+PHP_VERSIONS=("${PHP_VERSIONS_DEFAULT[@]}")
+PHP_DEFAULT="${PHP_DEFAULT:-8.2}"
+
+VHM_DOMAIN="${VHM_DOMAIN:-vhost-manager.local}"
+VHM_ROOT="${VHM_ROOT:-/var/www/html/vhost-manager}"
+VHM_PHP_FPM_VERSION="${VHM_PHP_FPM_VERSION:-8.2}" # required by user
+
+NGINX_SITE_AVAIL="/etc/nginx/sites-available/${VHM_DOMAIN}.conf"
+NGINX_SITE_ENAB="/etc/nginx/sites-enabled/${VHM_DOMAIN}.conf"
+
+APACHE_SITE_AVAIL="/etc/apache2/sites-available/${VHM_DOMAIN}.conf"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+backup_if_exists() {
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    cp -a "$f" "${f}.bak.${ts}"
+    log_warn "Backup created: ${f}.bak.${ts}"
   fi
 }
 
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+systemctl_or_service_reload() {
+  local svc="$1"
+  if run_quiet systemctl is-enabled "$svc"; then
+    systemctl reload "$svc" >/dev/null 2>&1 || systemctl restart "$svc" >/dev/null 2>&1 || true
+  else
+    service "$svc" reload >/dev/null 2>&1 || service "$svc" restart >/dev/null 2>&1 || true
+  fi
+}
 
-# ---- Start ----
-need_root
+systemctl_or_service_enable_now() {
+  local svc="$1"
+  systemctl enable --now "$svc" >/dev/null 2>&1 || service "$svc" start >/dev/null 2>&1 || true
+}
 
-log "Cập nhật apt + cài tool nền tảng..."
-apt-get update -y
-apt-get install -y ca-certificates curl gnupg lsb-release software-properties-common apt-transport-https
+ensure_hosts_entry() {
+  local domain="$1"
+  if grep -qE "^[[:space:]]*127\.0\.0\.1[[:space:]]+${domain}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    log_ok "/etc/hosts already has: 127.0.0.1 $domain"
+  else
+    echo -e "127.0.0.1\t${domain}\t# wsl-vhost-manager" >> /etc/hosts
+    log_ok "Added to /etc/hosts: 127.0.0.1 $domain"
+  fi
+}
 
-# ---- Ondrej PPA (safe add) ----
+# -----------------------------
+# Apt + base dependencies
+# -----------------------------
+log_info "apt update + base deps..."
+apt_update_once
+apt_install ca-certificates curl gnupg lsb-release software-properties-common apt-transport-https
+
+# Ondrej PHP PPA (safe add)
 if ! grep -R "ondrej/php" -n /etc/apt/sources.list /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
-  log "Thêm Ondřej PHP PPA..."
+  log_info "Adding Ondrej PHP PPA..."
   add-apt-repository -y ppa:ondrej/php
 else
-  log "Ondřej PHP PPA đã tồn tại, bỏ qua."
+  log_ok "Ondrej PHP PPA already exists."
 fi
 
-log "Cập nhật apt sau khi có PPA..."
+log_info "apt update after PPA..."
 apt-get update -y
 
-# ---- Core tools ----
-log "Cài công cụ dev: git, zip/unzip, composer, nodejs/npm, supervisor..."
-apt-get install -y git unzip zip composer nodejs npm supervisor
+# Core tools
+log_info "Installing core tools..."
+apt_install git unzip zip supervisor composer
 
-# ---- Web server ----
-log "Cài Nginx..."
-apt-get install -y nginx nginx-extras
+# Web servers + DB
+log_info "Installing Nginx + Apache2 + MariaDB..."
+apt_install nginx nginx-extras apache2 mariadb-server mariadb-client
 
-# ---- DB (MariaDB) ----
-log "Cài MariaDB server/client..."
-apt-get install -y mariadb-server mariadb-client
+# Enable Apache modules for proxy_fcgi
+log_info "Enabling Apache modules (proxy/proxy_fcgi/setenvif/rewrite/headers)..."
+a2enmod proxy proxy_fcgi setenvif rewrite headers >/dev/null 2>&1 || true
 
-# ---- PHP versions ----
-PHP_VERSIONS=("8.1" "8.2" "8.3")
+# -----------------------------
+# PHP multi-version + extensions
+# -----------------------------
+# Core extensions (Laravel + WordPress)
+EXT_CORE=("common" "cli" "fpm" "bcmath" "curl" "mbstring" "intl" "zip" "xml" "gd" "mysql" "sqlite3" "soap" "opcache" "readline")
+EXT_EXTRA=("imagick" "redis" "memcached")
+EXT_DEBUG=("xdebug")
 
-# ---- Extensions sets ----
-# Core for Laravel + WordPress
-EXT_CORE=(
-  "common" "cli" "fpm"
-  "bcmath" "curl" "mbstring" "intl" "zip" "xml" "gd" "mysql" "soap" "opcache" "readline"
-)
-
-# Recommended extras
-EXT_EXTRA=(
-  "imagick" "redis" "memcached"
-)
-
-# Optional (debug)
-EXT_DEBUG=(
-  "xdebug"
-)
-
-log "Cài PHP multi-version + extensions (Laravel + WordPress)..."
+log_info "Installing PHP (${PHP_VERSIONS[*]}) + extensions..."
 pkgs=()
 for v in "${PHP_VERSIONS[@]}"; do
-  for e in "${EXT_CORE[@]}"; do
-    pkgs+=("php${v}-${e}")
+  for e in "${EXT_CORE[@]}";  do pkgs+=("php${v}-${e}"); done
+  for e in "${EXT_EXTRA[@]}"; do pkgs+=("php${v}-${e}"); done
+  for e in "${EXT_DEBUG[@]}"; do pkgs+=("php${v}-${e}"); done
+done
+apt_install "${pkgs[@]}"
+
+# ---- PHP dev ini tuning (CLI + FPM) ----
+log_info "Thiết lập php.ini best-practice cho DEV (error display/log/upload/timeout...)..."
+
+# Bạn có thể đổi timezone theo ý (mặc định UTC)
+PHP_DEV_TIMEZONE="${PHP_DEV_TIMEZONE:-UTC}"
+PHP_DEV_MEMORY_LIMIT="${PHP_DEV_MEMORY_LIMIT:-512M}"
+PHP_DEV_UPLOAD_MAX="${PHP_DEV_UPLOAD_MAX:-128M}"
+PHP_DEV_POST_MAX="${PHP_DEV_POST_MAX:-128M}"
+PHP_DEV_MAX_EXEC="${PHP_DEV_MAX_EXEC:-300}"
+PHP_DEV_MAX_INPUT_TIME="${PHP_DEV_MAX_INPUT_TIME:-300}"
+PHP_DEV_MAX_INPUT_VARS="${PHP_DEV_MAX_INPUT_VARS:-5000}"
+
+mkdir -p /var/log/php
+chmod 0755 /var/log/php || true
+
+for v in "${PHP_VERSIONS[@]}"; do
+  for sapi in cli fpm; do
+    conf_dir="/etc/php/${v}/${sapi}/conf.d"
+    dev_ini="${conf_dir}/99-dev.ini"
+    mkdir -p "${conf_dir}"
+
+    cat > "${dev_ini}" <<EOF
+; 99-dev.ini - generated by WSL-Dev-Kit setup-php-dev-wsl.sh
+; DEV-friendly settings (do NOT use in production)
+
+date.timezone=${PHP_DEV_TIMEZONE}
+
+; Errors
+error_reporting=E_ALL
+display_errors=On
+display_startup_errors=On
+log_errors=On
+html_errors=On
+; Log file per version+sapi
+error_log=/var/log/php/php${v}-${sapi}.log
+
+; Resource limits (tune for local dev)
+memory_limit=${PHP_DEV_MEMORY_LIMIT}
+max_execution_time=${PHP_DEV_MAX_EXEC}
+max_input_time=${PHP_DEV_MAX_INPUT_TIME}
+max_input_vars=${PHP_DEV_MAX_INPUT_VARS}
+
+; Uploads
+file_uploads=On
+upload_max_filesize=${PHP_DEV_UPLOAD_MAX}
+post_max_size=${PHP_DEV_POST_MAX}
+
+; Opcache (DEV: keep enabled but revalidate frequently)
+opcache.enable=1
+opcache.enable_cli=1
+opcache.validate_timestamps=1
+opcache.revalidate_freq=0
+EOF
+
+    log_info "Wrote ${dev_ini}"
   done
-  for e in "${EXT_EXTRA[@]}"; do
-    pkgs+=("php${v}-${e}")
-  done
-  for e in "${EXT_DEBUG[@]}"; do
-    pkgs+=("php${v}-${e}")
-  done
+
+  # Extra FPM best practices: catch worker output into logs
+  pool_conf="/etc/php/${v}/fpm/pool.d/www.conf"
+  if [[ -f "${pool_conf}" ]]; then
+    # ensure catch_workers_output = yes (idempotent)
+    if grep -qE '^\s*catch_workers_output\s*=' "${pool_conf}"; then
+      sed -i 's/^\s*catch_workers_output\s*=.*/catch_workers_output = yes/' "${pool_conf}"
+    else
+      echo "catch_workers_output = yes" >> "${pool_conf}"
+    fi
+
+    # ensure php_admin_value[error_log] points to our fpm log (stronger guarantee than error_log)
+    if grep -qE '^\s*php_admin_value\[error_log\]\s*=' "${pool_conf}"; then
+      sed -i "s~^\s*php_admin_value\[error_log\]\s*=.*~php_admin_value[error_log] = /var/log/php/php${v}-fpm.log~" "${pool_conf}"
+    else
+      echo "php_admin_value[error_log] = /var/log/php/php${v}-fpm.log" >> "${pool_conf}"
+    fi
+
+    if grep -qE '^\s*php_admin_flag\[log_errors\]\s*=' "${pool_conf}"; then
+      sed -i 's/^\s*php_admin_flag\[log_errors\]\s*=.*/php_admin_flag[log_errors] = on/' "${pool_conf}"
+    else
+      echo "php_admin_flag[log_errors] = on" >> "${pool_conf}"
+    fi
+
+    log_info "Updated ${pool_conf} (catch_workers_output + php_admin error_log)"
+  fi
 done
 
-# Install everything in one apt call
-apt-get install -y "${pkgs[@]}"
-
-# ---- Enable + restart FPM services ----
-log "Enable & restart php-fpm services..."
+# Enable + restart FPM services
+log_info "Enable & restart php-fpm services..."
 for v in "${PHP_VERSIONS[@]}"; do
   systemctl enable --now "php${v}-fpm" >/dev/null 2>&1 || true
-  systemctl restart "php${v}-fpm" || true
+  systemctl restart "php${v}-fpm" >/dev/null 2>&1 || true
 done
 
-log "Restart/reload nginx..."
-systemctl enable --now nginx >/dev/null 2>&1 || true
-nginx -t
-systemctl reload nginx || systemctl restart nginx
+# Enable services
+log_info "Enable & start MariaDB..."
+systemctl enable --now mariadb >/dev/null 2>&1 || true
+systemctl restart mariadb >/dev/null 2>&1 || true
 
-# ---- WP-CLI ----
-log "Cài WP-CLI..."
-if ! have_cmd wp; then
+log_info "Enable & start Nginx..."
+systemctl enable --now nginx >/dev/null 2>&1 || true
+
+log_info "Enable & start Apache2..."
+systemctl enable --now apache2 >/dev/null 2>&1 || true
+
+# -----------------------------
+# WP-CLI (optional but useful)
+# -----------------------------
+log_info "Installing WP-CLI (if missing)..."
+if ! have wp; then
   tmp="/tmp/wp-cli.phar"
   curl -fsSL -o "${tmp}" https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
   php "${tmp}" --info >/dev/null
   chmod +x "${tmp}"
   mv "${tmp}" /usr/local/bin/wp
+  log_ok "WP-CLI installed."
 else
-  log "WP-CLI đã có sẵn, bỏ qua."
+  log_ok "WP-CLI already exists."
 fi
 
-# ---- Convenience: ensure mariadb is up ----
-log "Enable & start MariaDB..."
-systemctl enable --now mariadb >/dev/null 2>&1 || true
-systemctl restart mariadb || true
+# -----------------------------
+# PHP CLI switcher (update-alternatives) + php-cli command
+# -----------------------------
+log_info "Configuring PHP CLI switcher (php-cli)..."
 
-# ---- Summary / Checklist ----
-echo
-echo "============================================================"
-echo -e "${GREEN}✅ SETUP HOÀN TẤT: PHP Dev Environment (Laravel + WordPress)${NC}"
-echo "============================================================"
-echo
+for v in "${PHP_VERSIONS[@]}"; do
+  if [[ -x "/usr/bin/php${v}" ]]; then
+    prio="$(echo "$v" | tr -d '.')"
+    update-alternatives --install /usr/bin/php php "/usr/bin/php${v}" "${prio}" >/dev/null 2>&1 || true
+  else
+    log_warn "Missing /usr/bin/php${v} (php${v}-cli may not be installed?)"
+  fi
+done
 
-# WSL detection (best-effort)
-if grep -qi microsoft /proc/version 2>/dev/null; then
-  echo -e "WSL: ${GREEN}Yes${NC}  (detected)"
-else
-  echo -e "WSL: ${YELLOW}Unknown${NC}"
+cat > /usr/local/bin/php-cli <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<USAGE
+php-cli: switch PHP CLI version quickly (update-alternatives)
+
+Usage:
+  php-cli list
+  php-cli current
+  php-cli default <version>     # ex: php-cli default 8.2
+
+Notes:
+  - This switches /usr/bin/php (CLI).
+USAGE
+}
+
+cmd="${1:-}"
+arg="${2:-}"
+
+[[ -n "$cmd" ]] || { usage; exit 1; }
+
+case "$cmd" in
+  list)
+    echo "Available PHP CLI alternatives:"
+    update-alternatives --list php 2>/dev/null || echo "(No alternatives configured)"
+    ;;
+  current)
+    echo -n "Current PHP CLI: "
+    php -v | head -n 1 || true
+    echo -n "Alternative points to: "
+    readlink -f "$(command -v php)" || true
+    ;;
+  default)
+    [[ -n "${arg}" ]] || { echo "[FAIL] Missing version. Example: php-cli default 8.2" >&2; exit 1; }
+    target="/usr/bin/php${arg}"
+    [[ -x "${target}" ]] || { echo "[FAIL] ${target} not found or not executable." >&2; exit 1; }
+    sudo update-alternatives --set php "${target}" >/dev/null
+    echo "[OK] Switched PHP CLI to ${arg}"
+    php -v | head -n 1 || true
+    ;;
+  *)
+    usage; exit 1 ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/php-cli
+
+cat > /etc/profile.d/php-cli-switch.sh <<'EOF'
+# Quick PHP CLI switch:
+#   php-cli default 8.2
+#   php-cli current
+#   php-cli list
+alias set-php-cli='php-cli default'
+EOF
+chmod 0644 /etc/profile.d/php-cli-switch.sh
+
+# set default CLI now (best effort)
+if [[ -x "/usr/bin/php${PHP_DEFAULT}" ]]; then
+  update-alternatives --set php "/usr/bin/php${PHP_DEFAULT}" >/dev/null 2>&1 || true
 fi
 
+log_ok "php-cli installed. Try: php-cli list | php-cli default 8.1 | php-cli current"
+
+# -----------------------------
+# Deploy vhost-manager to /var/www/html/vhost-manager
+# -----------------------------
+SRC_VHM="${REPO_ROOT}/vhost-manager"
+if [[ ! -d "$SRC_VHM" ]]; then
+  die "Missing folder in repo: ${SRC_VHM}"
+fi
+
+log_info "Deploying vhost-manager -> ${VHM_ROOT}"
+ensure_dir "/var/www/html"
+ensure_dir "${VHM_ROOT}"
+
+# Copy (idempotent, overwrites changed files but preserves folder)
+# Use rsync if available; fallback to cp -a
+if have rsync; then
+  rsync -a --delete "${SRC_VHM}/" "${VHM_ROOT}/"
+else
+  # simple approach: copy all files over
+  cp -a "${SRC_VHM}/." "${VHM_ROOT}/"
+fi
+
+chown -R www-data:www-data "${VHM_ROOT}" || true
+find "${VHM_ROOT}" -type d -exec chmod 0755 {} \; || true
+find "${VHM_ROOT}" -type f -exec chmod 0644 {} \; || true
+
+log_ok "vhost-manager deployed at: ${VHM_ROOT}"
+
+# Ensure /etc/hosts has domain (WSL side)
+ensure_hosts_entry "${VHM_DOMAIN}"
+
+# -----------------------------
+# Create Nginx vhost for vhost-manager.local (PHP-FPM 8.2)
+# -----------------------------
+PHP_FPM_SOCK="/run/php/php${VHM_PHP_FPM_VERSION}-fpm.sock"
+if [[ ! -S "${PHP_FPM_SOCK}" ]]; then
+  log_warn "PHP-FPM socket not found yet: ${PHP_FPM_SOCK}"
+  log_warn "Trying to restart php${VHM_PHP_FPM_VERSION}-fpm..."
+  systemctl restart "php${VHM_PHP_FPM_VERSION}-fpm" >/dev/null 2>&1 || true
+fi
+
+backup_if_exists "${NGINX_SITE_AVAIL}"
+cat > "${NGINX_SITE_AVAIL}" <<EOF
+server {
+  listen 80;
+  server_name ${VHM_DOMAIN};
+
+  root ${VHM_ROOT};
+  index index.php index.html;
+
+  access_log /var/log/nginx/${VHM_DOMAIN}.access.log;
+  error_log  /var/log/nginx/${VHM_DOMAIN}.error.log;
+
+  location / {
+    try_files \$uri \$uri/ /index.php?\$query_string;
+  }
+
+  location ~ \.php\$ {
+    include snippets/fastcgi-php.conf;
+    fastcgi_pass unix:${PHP_FPM_SOCK};
+    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+    include fastcgi_params;
+  }
+
+  location ~ /\.(?!well-known).* {
+    deny all;
+  }
+}
+EOF
+
+# enable site
+ensure_dir /etc/nginx/sites-enabled
+ln -sf "${NGINX_SITE_AVAIL}" "${NGINX_SITE_ENAB}"
+
+log_info "Testing Nginx config..."
+nginx -t
+
+log_info "Verifying PDO SQLite drivers..."
+php -m | egrep -i 'pdo|sqlite' || true
+
+log_info "Reloading Nginx..."
+systemctl_or_service_reload nginx
+log_ok "Nginx site enabled: http://${VHM_DOMAIN}/  (PHP-FPM ${VHM_PHP_FPM_VERSION})"
+
+# -----------------------------
+# Create Apache vhost for vhost-manager.local (proxy_fcgi to php8.2-fpm.sock)
+# -----------------------------
+backup_if_exists "${APACHE_SITE_AVAIL}"
+cat > "${APACHE_SITE_AVAIL}" <<EOF
+<VirtualHost *:80>
+  ServerName ${VHM_DOMAIN}
+  DocumentRoot ${VHM_ROOT}
+
+  ErrorLog \${APACHE_LOG_DIR}/${VHM_DOMAIN}.error.log
+  CustomLog \${APACHE_LOG_DIR}/${VHM_DOMAIN}.access.log combined
+
+  <Directory ${VHM_ROOT}>
+    Options Indexes FollowSymLinks
+    AllowOverride All
+    Require all granted
+  </Directory>
+
+  # Route PHP to PHP-FPM ${VHM_PHP_FPM_VERSION}
+  <FilesMatch \.php$>
+    SetHandler "proxy:unix:${PHP_FPM_SOCK}|fcgi://localhost/"
+  </FilesMatch>
+</VirtualHost>
+EOF
+
+log_info "Enabling Apache site..."
+a2ensite "${VHM_DOMAIN}.conf" >/dev/null 2>&1 || true
+
+log_info "Testing Apache config..."
+apachectl -t
+
+log_info "Reloading Apache2..."
+systemctl_or_service_reload apache2
+log_ok "Apache site enabled: http://${VHM_DOMAIN}/  (proxy_fcgi -> PHP-FPM ${VHM_PHP_FPM_VERSION})"
+
+# -----------------------------
+# Allow vhost-manager (www-data) to run provisioning commands via sudo (NOPASSWD)
+# -----------------------------
+log_info "Configuring sudoers for web user (www-data) to allow vhost-manager provisioning..."
+
+# Ensure sudo exists
+apt_install sudo
+
+# Ensure www-data exists (should exist after nginx/apache install, but just in case)
+id www-data >/dev/null 2>&1 || {
+  log_warn "User www-data not found. Creating..."
+  useradd -r -s /usr/sbin/nologin www-data || true
+}
+
+SUDOERS_FILE="/etc/sudoers.d/90-www-data-vhost-manager"
+cat > "$SUDOERS_FILE" <<'EOF'
+# Allow vhost-manager (running as www-data) to perform DEV provisioning without password.
+# DEV ONLY. Tighten later if needed.
+Defaults:www-data !requiretty
+
+# Minimal-but-practical command set for vhost provisioning:
+www-data ALL=(root) NOPASSWD: \
+  /usr/bin/tee, /bin/cat, /bin/ln, /bin/rm, /bin/mkdir, /bin/chmod, /bin/chown, /usr/bin/find, \
+  /usr/sbin/nginx, /bin/systemctl, /usr/sbin/service, \
+  /usr/sbin/a2ensite, /usr/sbin/a2dissite, /usr/sbin/a2enmod, /usr/sbin/a2dismod, /usr/sbin/apachectl, \
+  /usr/bin/mysql, /usr/bin/mariadb, /usr/bin/mysqladmin, \
+  /usr/bin/php, /usr/sbin/php-fpm8.1, /usr/sbin/php-fpm8.2, /usr/sbin/php-fpm8.3
+EOF
+
+chmod 0440 "$SUDOERS_FILE"
+
+# Validate sudoers syntax (fail fast)
+visudo -cf "$SUDOERS_FILE" >/dev/null
+log_ok "Sudoers configured: $SUDOERS_FILE"
+
+# Quick check: sudo -n true must succeed for www-data
+if sudo -u www-data -n true 2>/dev/null; then
+  log_ok "www-data can sudo non-interactively (sudo -n true OK)."
+else
+  log_warn "www-data still cannot sudo -n. Showing debug:"
+  sudo -u www-data -n true || true
+fi
+
+# -----------------------------
+# Notes: Nginx & Apache both binding :80
+# -----------------------------
+echo
+log_warn "IMPORTANT:"
+log_warn "Both Nginx and Apache are configured for ${VHM_DOMAIN} on port 80."
+log_warn "They cannot both listen on :80 at the same time."
+log_warn "Choose ONE web server to be the active listener on port 80:"
+echo "  - If you want NGINX to serve ${VHM_DOMAIN}:"
+echo "      sudo systemctl stop apache2"
+echo "      sudo systemctl restart nginx"
+echo
+echo "  - If you want APACHE to serve ${VHM_DOMAIN}:"
+echo "      sudo systemctl stop nginx"
+echo "      sudo systemctl restart apache2"
+echo
+log_info "WSL hosts added: /etc/hosts -> 127.0.0.1 ${VHM_DOMAIN}"
+log_info "If you open in Windows browser and it doesn't resolve, add to Windows hosts too."
+
+# -----------------------------
+# Summary
+# -----------------------------
+echo
+echo "============================================================"
+echo "$(_color 32 "✅ SETUP DONE: PHP Dev + vhost-manager.local")"
+echo "============================================================"
 echo
 echo "---- Versions ----"
 echo -n "PHP (CLI): "; php -v | head -n 1 || true
 echo -n "Composer: "; composer --version 2>/dev/null || true
 echo -n "Nginx: "; nginx -v 2>&1 || true
-echo -n "Node: "; node -v 2>/dev/null || true
-echo -n "NPM: "; npm -v 2>/dev/null || true
+echo -n "Apache: "; apache2 -v | head -n 1 2>/dev/null || true
 echo -n "WP-CLI: "; wp --version 2>/dev/null || true
 echo -n "MariaDB: "; mariadb --version 2>/dev/null || mysql --version 2>/dev/null || true
 
 echo
-echo "---- Services ----"
-for svc in nginx mariadb php8.1-fpm php8.2-fpm php8.3-fpm; do
-  state="$(systemctl is-active "${svc}" 2>/dev/null || true)"
-  if [[ "${state}" == "active" ]]; then
-    echo -e "${svc}: ${GREEN}${state}${NC}"
-  else
-    echo -e "${svc}: ${YELLOW}${state}${NC}"
-  fi
-done
-
-echo
 echo "---- PHP-FPM sockets ----"
-ls -lah /run/php/ 2>/dev/null | egrep "php(8\.1|8\.2|8\.3)-fpm\.sock" || echo "(Không thấy socket trong /run/php - kiểm tra service php-fpm)"
+ls -lah /run/php/ 2>/dev/null | egrep "php(8\.1|8\.2|8\.3)-fpm\.sock" || echo "(No sockets found - check php-fpm services)"
 
 echo
-echo "---- Extension checklist (dom/xml/mbstring/curl/zip/gd/imagick/intl/mysqli/pdo_mysql/opcache/redis) ----"
-check_exts='dom|xml|mbstring|curl|zip|gd|imagick|intl|mysqli|pdo_mysql|opcache|redis'
-echo "[CLI]"; php -m | egrep "${check_exts}" | sort -u || true
-
-for v in "${PHP_VERSIONS[@]}"; do
-  echo
-  echo "[FPM ${v}]"
-  if have_cmd "php-fpm${v}"; then
-    "php-fpm${v}" -m | egrep "${check_exts}" | sort -u || true
-    echo -n "Loaded php.ini: "
-    "php-fpm${v}" -i 2>/dev/null | grep -i "Loaded Configuration File" | head -n 1 || true
-  else
-    echo "php-fpm${v} not found"
-  fi
-done
+echo "---- Quick CLI switch ----"
+echo "  php-cli list"
+echo "  php-cli current"
+echo "  php-cli default 8.1   # or 8.2 / 8.3"
+echo "  set-php-cli 8.2       # alias"
 
 echo
-echo "---- Next steps (gợi ý) ----"
-cat <<'TXT'
-1) Map vhost Nginx -> đúng socket:
-   fastcgi_pass unix:/run/php/php8.2-fpm.sock;  (hoặc 8.1/8.3 tuỳ dự án)
-
-2) Nếu composer vẫn báo thiếu ext ở dự án nào:
-   - kiểm tra đúng FPM version đang chạy cho vhost đó
-   - kiểm tra module: php-fpm8.x -m
-
-3) (Tuỳ chọn) Bật/Config Xdebug chỉ khi cần debug để tránh chậm.
-TXT
-
+echo "---- vhost-manager ----"
+echo "  Domain: ${VHM_DOMAIN}"
+echo "  Root  : ${VHM_ROOT}"
+echo "  Nginx : ${NGINX_SITE_AVAIL}"
+echo "  Apache: ${APACHE_SITE_AVAIL}"
 echo
-echo -e "${GREEN}✅ Ready for Laravel + WordPress development on WSL Ubuntu 22.04.${NC}"
